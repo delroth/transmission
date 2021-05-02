@@ -27,7 +27,8 @@
 
 enum
 {
-    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100
+    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100,
+    MAX_VERIFIER_PARALLELISM = 128
 };
 
 static bool verifyTorrent(tr_torrent* tor, bool* stopFlag)
@@ -278,6 +279,43 @@ tr_verifier* tr_verifyInit(void)
     v->lock = tr_lockNew();
     v->maxVerificationThreads = 1;
     return v;
+}
+
+int tr_verifyGetParallelism(tr_verifier* v)
+{
+    return v->maxVerificationThreads;
+}
+
+void tr_verifySetParallelism(tr_verifier* v, int parallelism)
+{
+    /* Clamp up/down to reasonable limits. */
+    if (parallelism < 1)
+    {
+        parallelism = 1;
+    }
+    else if (parallelism > MAX_VERIFIER_PARALLELISM)
+    {
+        parallelism = MAX_VERIFIER_PARALLELISM;
+    }
+
+    tr_lockLock(v->lock);
+
+    v->maxVerificationThreads = parallelism;
+
+    /* If any work is currently pending and we can start more threads, do so
+     * now to pick up the queue. */
+    for (tr_list* l = v->pendingList; l != NULL; l = l->next)
+    {
+        if (v->activeVerificationThreads >= v->maxVerificationThreads)
+        {
+            break;
+        }
+
+        v->activeVerificationThreads++;
+        tr_threadNew(verifyThreadFunc, v);
+    }
+
+    tr_lockUnlock(v->lock);
 }
 
 void tr_verifyAdd(tr_verifier* v, tr_torrent* tor, tr_verify_done_func callback_func, void* callback_data)
