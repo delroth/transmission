@@ -406,6 +406,7 @@ static struct tr_key_struct const my_static[] =
     Q("ut_recommend"),
     Q("utp-enabled"),
     Q("v"),
+    Q("verifier-parallelism"),
     Q("version"),
     Q("wanted"),
     Q("warning message"),
