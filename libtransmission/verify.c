@@ -359,15 +359,27 @@ void tr_verifyClose(tr_session* session)
 {
     TR_UNUSED(session);
 
-    tr_lockLock(getVerifyLock());
-
-    for (tr_list* l = activeList; l != NULL; l = l->next)
-    {
-        struct verify_node* active = l->data;
-        active->request_abort = true;
-    }
+    tr_lock* lock = getVerifyLock();
+    tr_lockLock(lock);
 
     tr_list_free(&pendingList, tr_free);
 
-    tr_lockUnlock(getVerifyLock());
+    /* Request all active threads to abort and wait for completion. */
+    if (activeVerificationThreads > 0)
+    {
+        for (tr_list* l = activeList; l != NULL; l = l->next)
+        {
+            struct verify_node* active = l->data;
+            active->request_abort = true;
+        }
+
+        while (activeVerificationThreads > 0)
+        {
+            tr_lockUnlock(lock);
+            tr_wait_msec(100);
+            tr_lockLock(lock);
+        }
+    }
+
+    tr_lockUnlock(lock);
 }
