@@ -27,8 +27,7 @@
 
 enum
 {
-    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100,
-    DEFAULT_THREAD_POOL_SIZE = 1
+    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100
 };
 
 static bool verifyTorrent(tr_torrent* tor, bool* stopFlag)
@@ -167,6 +166,15 @@ static bool verifyTorrent(tr_torrent* tor, bool* stopFlag)
 ****
 ***/
 
+struct tr_verifier
+{
+    tr_lock* lock;
+    tr_list* activeList;
+    tr_list* pendingList;
+    int activeVerificationThreads;
+    int maxVerificationThreads;
+};
+
 struct verify_node
 {
     tr_torrent* torrent;
@@ -177,26 +185,9 @@ struct verify_node
     bool request_abort;
 };
 
-static tr_list* activeList = NULL;
-static tr_list* pendingList = NULL;
-static int activeVerificationThreads = 0;
-static int maxVerificationThreads = DEFAULT_THREAD_POOL_SIZE;
-
-static tr_lock* getVerifyLock(void)
-{
-    static tr_lock* lock = NULL;
-
-    if (lock == NULL)
-    {
-        lock = tr_lockNew();
-    }
-
-    return lock;
-}
-
 static void verifyThreadFunc(void* user_data)
 {
-    TR_UNUSED(user_data);
+    tr_verifier* v = user_data;
 
     for (;;)
     {
@@ -204,22 +195,22 @@ static void verifyThreadFunc(void* user_data)
         tr_torrent* tor;
         struct verify_node* node;
 
-        tr_lockLock(getVerifyLock());
-        if (activeVerificationThreads > maxVerificationThreads)
+        tr_lockLock(v->lock);
+        if (v->activeVerificationThreads > v->maxVerificationThreads)
         {
             /* Attempt to downsize the thread pool. */
             break;
         }
 
-        node = tr_list_pop_front(&pendingList);
+        node = tr_list_pop_front(&v->pendingList);
 
         if (node == NULL)
         {
             break;
         }
 
-        tr_list_prepend(&activeList, node);
-        tr_lockUnlock(getVerifyLock());
+        tr_list_prepend(&v->activeList, node);
+        tr_lockUnlock(v->lock);
 
         tor = node->torrent;
         tr_logAddTorInfo(tor, "%s", _("Verifying torrent"));
@@ -228,7 +219,7 @@ static void verifyThreadFunc(void* user_data)
         tr_torrentSetVerifyState(tor, TR_VERIFY_NONE);
         TR_ASSERT(tr_isTorrent(tor));
 
-        tr_lockLock(getVerifyLock());
+        tr_lockLock(v->lock);
         if (!node->request_abort && changed)
         {
             tr_torrentSetDirty(tor);
@@ -244,13 +235,13 @@ static void verifyThreadFunc(void* user_data)
             *node->completion_signal = true;
         }
 
-        tr_list_remove_data(&activeList, node);
+        tr_list_remove_data(&v->activeList, node);
         tr_free(node);
-        tr_lockUnlock(getVerifyLock());
+        tr_lockUnlock(v->lock);
     }
 
-    activeVerificationThreads--;
-    tr_lockUnlock(getVerifyLock());
+    v->activeVerificationThreads--;
+    tr_lockUnlock(v->lock);
 }
 
 static int compareVerifyByPriorityAndSize(void const* va, void const* vb)
@@ -281,7 +272,15 @@ static int compareVerifyByPriorityAndSize(void const* va, void const* vb)
     return 0;
 }
 
-void tr_verifyAdd(tr_torrent* tor, tr_verify_done_func callback_func, void* callback_data)
+tr_verifier* tr_verifyInit(void)
+{
+    tr_verifier* v = tr_new0(tr_verifier, 1);
+    v->lock = tr_lockNew();
+    v->maxVerificationThreads = 1;
+    return v;
+}
+
+void tr_verifyAdd(tr_verifier* v, tr_torrent* tor, tr_verify_done_func callback_func, void* callback_data)
 {
     TR_ASSERT(tr_isTorrent(tor));
     tr_logAddTorInfo(tor, "%s", _("Queued for verification"));
@@ -294,17 +293,17 @@ void tr_verifyAdd(tr_torrent* tor, tr_verify_done_func callback_func, void* call
     node->request_abort = false;
     node->completion_signal = NULL;
 
-    tr_lockLock(getVerifyLock());
+    tr_lockLock(v->lock);
     tr_torrentSetVerifyState(tor, TR_VERIFY_WAIT);
-    tr_list_insert_sorted(&pendingList, node, compareVerifyByPriorityAndSize);
+    tr_list_insert_sorted(&v->pendingList, node, compareVerifyByPriorityAndSize);
 
-    if (activeVerificationThreads < maxVerificationThreads)
+    if (v->activeVerificationThreads < v->maxVerificationThreads)
     {
-        activeVerificationThreads++;
-        tr_threadNew(verifyThreadFunc, NULL);
+        v->activeVerificationThreads++;
+        tr_threadNew(verifyThreadFunc, v);
     }
 
-    tr_lockUnlock(getVerifyLock());
+    tr_lockUnlock(v->lock);
 }
 
 static int compareVerifyByTorrent(void const* va, void const* vb)
@@ -314,14 +313,13 @@ static int compareVerifyByTorrent(void const* va, void const* vb)
     return a->torrent - b;
 }
 
-void tr_verifyRemove(tr_torrent* tor)
+void tr_verifyRemove(tr_verifier* v, tr_torrent* tor)
 {
     TR_ASSERT(tr_isTorrent(tor));
 
-    tr_lock* lock = getVerifyLock();
-    tr_lockLock(lock);
+    tr_lockLock(v->lock);
 
-    tr_list* l = tr_list_find(activeList, tor, compareVerifyByTorrent);
+    tr_list* l = tr_list_find(v->activeList, tor, compareVerifyByTorrent);
     if (l != NULL)
     {
         struct verify_node* active = l->data;
@@ -331,14 +329,14 @@ void tr_verifyRemove(tr_torrent* tor)
         active->request_abort = true;
         while (!completed)
         {
-            tr_lockUnlock(lock);
+            tr_lockUnlock(v->lock);
             tr_wait_msec(100);
-            tr_lockLock(lock);
+            tr_lockLock(v->lock);
         }
     }
     else
     {
-        struct verify_node* node = tr_list_remove(&pendingList, tor, compareVerifyByTorrent);
+        struct verify_node* node = tr_list_remove(&v->pendingList, tor, compareVerifyByTorrent);
         tr_torrentSetVerifyState(tor, TR_VERIFY_NONE);
 
         if (node != NULL)
@@ -352,34 +350,36 @@ void tr_verifyRemove(tr_torrent* tor)
         }
     }
 
-    tr_lockUnlock(lock);
+    tr_lockUnlock(v->lock);
 }
 
-void tr_verifyClose(tr_session* session)
+void tr_verifyClose(tr_verifier* v)
 {
-    TR_UNUSED(session);
+    tr_lockLock(v->lock);
 
-    tr_lock* lock = getVerifyLock();
-    tr_lockLock(lock);
-
-    tr_list_free(&pendingList, tr_free);
+    tr_list_free(&v->pendingList, tr_free);
 
     /* Request all active threads to abort and wait for completion. */
-    if (activeVerificationThreads > 0)
+    if (v->activeVerificationThreads > 0)
     {
-        for (tr_list* l = activeList; l != NULL; l = l->next)
+        for (tr_list* l = v->activeList; l != NULL; l = l->next)
         {
             struct verify_node* active = l->data;
             active->request_abort = true;
         }
 
-        while (activeVerificationThreads > 0)
+        while (v->activeVerificationThreads > 0)
         {
-            tr_lockUnlock(lock);
+            tr_lockUnlock(v->lock);
             tr_wait_msec(100);
-            tr_lockLock(lock);
+            tr_lockLock(v->lock);
         }
     }
 
-    tr_lockUnlock(lock);
+    TR_ASSERT(v->pendingList == NULL);
+    TR_ASSERT(v->activeList == NULL);
+    tr_lockUnlock(v->lock);
+
+    tr_lockFree(v->lock);
+    tr_free(v);
 }

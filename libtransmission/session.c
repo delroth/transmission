@@ -764,6 +764,8 @@ static void tr_sessionInitImpl(void* vdata)
 
     session->shared = tr_sharedInit(session);
 
+    session->verifier = tr_verifyInit();
+
     /**
     ***  Blocklist
     **/
@@ -1963,7 +1965,6 @@ static void sessionCloseImplStart(tr_session* session)
     event_free(session->nowTimer);
     session->nowTimer = NULL;
 
-    tr_verifyClose(session);
     tr_sharedClose(session);
     tr_rpcClose(&session->rpcServer);
 
@@ -1991,6 +1992,9 @@ static void sessionCloseImplStart(tr_session* session)
 
     tr_cacheFree(session->cache);
     session->cache = NULL;
+
+    tr_verifyClose(session->verifier);
+    session->verifier = NULL;
 
     /* saveTimer is not used at this point, reusing for UDP shutdown wait */
     TR_ASSERT(session->saveTimer == NULL);
