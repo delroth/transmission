@@ -203,7 +203,7 @@ static void verifyThreadFunc(void* user_data)
         struct verify_node* node;
 
         tr_lockLock(getVerifyLock());
-        node = verifyList != NULL ? verifyList->data : NULL;
+        node = tr_list_pop_front(&verifyList);
 
         if (node == NULL)
         {
@@ -213,7 +213,6 @@ static void verifyThreadFunc(void* user_data)
 
         currentNode = *node;
         tor = currentNode.torrent;
-        tr_list_remove_data(&verifyList, node);
         tr_free(node);
         tr_lockUnlock(getVerifyLock());
 
