@@ -27,7 +27,8 @@
 
 enum
 {
-    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100
+    MSEC_TO_SLEEP_PER_SECOND_DURING_VERIFY = 100,
+    DEFAULT_THREAD_POOL_SIZE = 1
 };
 
 static bool verifyTorrent(tr_torrent* tor, bool* stopFlag)
@@ -178,7 +179,8 @@ struct verify_node
 
 static tr_list* activeList = NULL;
 static tr_list* pendingList = NULL;
-static tr_thread* verifyThread = NULL;
+static int activeVerificationThreads = 0;
+static int maxVerificationThreads = DEFAULT_THREAD_POOL_SIZE;
 
 static tr_lock* getVerifyLock(void)
 {
@@ -203,6 +205,12 @@ static void verifyThreadFunc(void* user_data)
         struct verify_node* node;
 
         tr_lockLock(getVerifyLock());
+        if (activeVerificationThreads > maxVerificationThreads)
+        {
+            /* Attempt to downsize the thread pool. */
+            break;
+        }
+
         node = tr_list_pop_front(&pendingList);
 
         if (node == NULL)
@@ -241,7 +249,7 @@ static void verifyThreadFunc(void* user_data)
         tr_lockUnlock(getVerifyLock());
     }
 
-    verifyThread = NULL;
+    activeVerificationThreads--;
     tr_lockUnlock(getVerifyLock());
 }
 
@@ -290,9 +298,10 @@ void tr_verifyAdd(tr_torrent* tor, tr_verify_done_func callback_func, void* call
     tr_torrentSetVerifyState(tor, TR_VERIFY_WAIT);
     tr_list_insert_sorted(&pendingList, node, compareVerifyByPriorityAndSize);
 
-    if (verifyThread == NULL)
+    if (activeVerificationThreads < maxVerificationThreads)
     {
-        verifyThread = tr_threadNew(verifyThreadFunc, NULL);
+        activeVerificationThreads++;
+        tr_threadNew(verifyThreadFunc, NULL);
     }
 
     tr_lockUnlock(getVerifyLock());
